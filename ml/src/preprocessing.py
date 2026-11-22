@@ -1,9 +1,18 @@
+"""Leakage-aware chronological preprocessing for direct multi-step forecasts."""
+from __future__ import annotations
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-def add_features(df):
-    out = df.copy()
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    needed = {"Open", "High", "Low", "Close", "Volume"}
+    if not needed.issubset(df.columns):
+        raise ValueError(f"Missing OHLCV columns: {sorted(needed-set(df.columns))}")
+    if (df[["Open", "High", "Low", "Close"]] <= 0).any().any() or (df["Volume"] < 0).any():
+        raise ValueError("OHLC prices must be positive and volume nonnegative")
+    out = df.copy().sort_index()
     out["Return"] = np.log(out["Close"]).diff()
     out["HL_range"] = (out["High"] - out["Low"]) / out["Close"]
     out["OC_change"] = (out["Close"] - out["Open"]) / out["Open"]
@@ -13,53 +22,82 @@ def add_features(df):
     out["Vol_change"] = np.log1p(out["Volume"]).diff()
     return out.replace([np.inf, -np.inf], np.nan).dropna()
 
-def split(df: pd.DataFrame, train_size=0.7, val_size=0.1):
+
+def split(df: pd.DataFrame, train_size: float = .7, val_size: float = .1):
+    if not (0 < train_size < 1 and 0 < val_size < 1 and train_size + val_size < 1):
+        raise ValueError("Expected 0 < train_size, val_size and train_size + val_size < 1")
     n = len(df)
-    train_len = int(n * train_size)
-    val_len = int(n * (train_size + val_size))
+    a, b = int(n * train_size), int(n * (train_size + val_size))
+    if a == 0 or b == a or b == n:
+        raise ValueError("Too few rows to form nonempty train, validation and test splits")
+    return df.iloc[:a].copy(), df.iloc[a:b].copy(), df.iloc[b:].copy()
 
-    return df.iloc[:train_len], df.iloc[train_len: val_len], df.iloc[val_len:]
 
-def fit_scalar(train_df):
-    feature_names = list(train_df.columns)
-    x_scalar = StandardScaler()
-    y_scalar = MinMaxScaler()
+def fit_scaler(train_df: pd.DataFrame):
+    if train_df.empty or "Close" not in train_df:
+        raise ValueError("Training data must contain Close prices")
+    names = list(train_df.columns)
+    # Standardize non-target predictors, but use the SAME target scaler for the
+    # Close input feature and for labels. This gives the linear skip a meaningful baseline.
+    x_scaler = StandardScaler().fit(train_df[names])
+    y_scaler = MinMaxScaler().fit(train_df[["Close"]])
+    return x_scaler, y_scaler, names
 
-    x_scalar.fit(train_df[feature_names])
-    y_scalar.fit(train_df[["Close"]])
-    return x_scalar, y_scalar, feature_names
+# Backward compatible alias for the original project's misspelling.
+fit_scalar = fit_scaler
 
-def transform_input(df: pd.DataFrame, x_scalar, feature_names):
-    return x_scalar.transform(df[feature_names]).astype(np.float32)
 
-def make_sequences(features, close_values, lookback=60, horizon=7):
-    X, y = [], []
-    for end in range(lookback, len(features) - horizon + 1):
-        X.append(features[end - lookback: end])
-        y.append(close_values[end: end + horizon].reshape(-1))
+def transform_input(df: pd.DataFrame, x_scaler, feature_names, y_scaler=None):
+    missing = set(feature_names) - set(df.columns)
+    if missing:
+        raise ValueError(f"Input missing features: {sorted(missing)}")
+    X = x_scaler.transform(df[feature_names]).astype(np.float32)
+    if y_scaler is not None and "Close" in feature_names:
+        X[:, feature_names.index("Close")] = y_scaler.transform(df[["Close"]]).ravel()
+    return X
 
-    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
+
+def make_sequences(features, close_values, lookback: int = 60, horizon: int = 7):
+    features, close_values = np.asarray(features), np.asarray(close_values)
+    if lookback < 1 or horizon < 1:
+        raise ValueError("lookback and horizon must be positive")
+    if len(features) != len(close_values):
+        raise ValueError("Features and targets length mismatch")
+    if len(features) < lookback + horizon:
+        raise ValueError("Insufficient rows: need at least lookback + horizon")
+    return windows_for_targets(lookback, len(features), features, close_values, lookback, horizon)
+
 
 def windows_for_targets(start, stop, X, y, lookback, horizon):
-    Xs, ys = [], []
+    if lookback < 1 or horizon < 1 or start < lookback or stop > len(X) or len(X) != len(y):
+        raise ValueError("Invalid window boundaries or input lengths")
+    if stop - start < horizon:
+        raise ValueError("Target segment needs at least horizon rows")
+    xs, ys = [], []
     for target_start in range(start, stop - horizon + 1):
-        Xs.append(X[target_start-lookback:target_start])
+        xs.append(X[target_start-lookback:target_start])
         ys.append(y[target_start:target_start+horizon])
-    return np.asarray(Xs, np.float32), np.asarray(ys, np.float32)
+    return np.asarray(xs, np.float32), np.asarray(ys, np.float32)
 
-def preprocessing(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, lookback=60, horizon=7):
-    x_scaler, y_scaler, feature_names = fit_scalar(train_df)
+
+def preprocessing(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
+                  lookback: int = 60, horizon: int = 7):
+    if lookback < 1 or horizon < 1:
+        raise ValueError("lookback and horizon must be positive")
+    if len(train_df) < lookback + horizon or len(val_df) < horizon or len(test_df) < horizon:
+        raise ValueError("Need train >= lookback+horizon, val >= horizon, test >= horizon")
+    if list(train_df.columns) != list(val_df.columns) or list(train_df.columns) != list(test_df.columns):
+        raise ValueError("Split feature columns must match")
+    if not (train_df.index.max() < val_df.index.min() < test_df.index.min()):
+        raise ValueError("Splits must be in strictly increasing chronological order")
+    x_scaler, y_scaler, names = fit_scaler(train_df)
     full = pd.concat([train_df, val_df, test_df])
-
-    X = transform_input(full, x_scaler, feature_names)
+    X = transform_input(full, x_scaler, names, y_scaler)
     y = y_scaler.transform(full[["Close"]]).astype(np.float32).ravel()
-
     a, b = len(train_df), len(train_df) + len(val_df)
-    X_train, y_train = make_sequences(X[:a], y[:a], lookback, horizon)
-    X_val, y_val = make_sequences(X[:b], y[:b], lookback, horizon)
-    X_test, y_test = make_sequences(X, y, lookback, horizon)
-    X_val, y_val = X_val[max(0, len(X_train)-lookback):], y_val[max(0, len(X_train)-lookback):]
-
-    X_val, y_val = windows_for_targets(a, b, X, y, lookback, horizon)
-    X_test, y_test = windows_for_targets(b, len(full), X, y, lookback, horizon)
-    return (X_train, y_train), (X_val, y_val), (X_test, y_test), x_scaler, y_scaler, feature_names
+    # Each set owns only targets in its date range; earlier features are
+    # available as historical context, never later information.
+    train = windows_for_targets(lookback, a, X, y, lookback, horizon)
+    val = windows_for_targets(a, b, X, y, lookback, horizon)
+    test = windows_for_targets(b, len(full), X, y, lookback, horizon)
+    return train, val, test, x_scaler, y_scaler, names
