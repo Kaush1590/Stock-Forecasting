@@ -147,9 +147,3 @@ python -m pytest -q
 - Test metrics are **single chronological holdout** scores, not walk-forward backtests. For investment research, add multiple walk-forward test periods, transaction costs, leakage audits, calibration, and realistic baselines.
 - Forecasts are **point estimates**. They are not prediction intervals or guarantees. Calendar schedules and symbol/currency selection should be checked independently.
 - All market data is for educational use, and exchange data is obtained from Yahoo Finance; availability varies by symbol.
-
-## License
-
-MIT. Inspired by the original repository: https://github.com/Kaush1590/Stock-Forecasting
-
-An example upload file is available at `examples/demo_ohlcv.csv`. It contains **synthetic data**, not real stock quotes. You can upload it in the dashboard's `Upload CSV` mode to test the parser (select any appropriate exchange calendar for the generated forecast dates).
