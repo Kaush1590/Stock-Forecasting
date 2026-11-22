@@ -10,11 +10,11 @@ def train_model(model, X_train, y_train, X_val, y_val, epochs=80, batch_size=32,
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=4
     )
-    criterion = nn.MSELoss()
+    criterion = nn.HuberLoss()
     best_loss, best_state, wait = float("inf"), None, 0
     history = {"train_loss": [], "val_loss": []}
 

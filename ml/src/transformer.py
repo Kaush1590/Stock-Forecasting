@@ -2,53 +2,65 @@ import math
 import torch
 from torch import nn
 
+
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, maxLen: int = 50000):
+    def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
-
-        zeroes = torch.zeros(maxLen, d_model)
-        position = torch.arange(0, maxLen, dtype=torch.int32).unsqueeze(1)
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
         div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        zeroes[:, 0::2] = torch.sin(position * div)
-        zeroes[:, 1::2] = torch.cos(position * div[:zeroes[:, 1::2].shape[1]])
-
-        self.register_buffer("zeroes", zeroes.unsqueeze(0))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
+        self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, x):
-        return x + self.zeroes[:, :x.size(1)]
+        return x + self.pe[:, : x.size(1)]
+
 
 class StockTransformer(nn.Module):
-    def __init__(self, n_features, horizon=7, d_model=64, nhead=4, num_layers=3, dim_feedforward=128, dropout=0.1):
+    def __init__(self, n_features, lookback=60, horizon=7, target_idx=3,
+                 d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
+                 dropout=0.3, input_dropout=0.1, noise_std=0.02):
         super().__init__()
-
         if d_model % nhead:
             raise ValueError("d_model must be divisible by nhead")
 
+        self.target_idx = target_idx          # column index of Close in the features
+        self.noise_std = noise_std
+
+        # Linear skip path: simple trend extrapolation from the Close history
+        self.linear_skip = nn.Linear(lookback, horizon)
+
+        self.input_norm = nn.LayerNorm(n_features)
+        self.input_dropout = nn.Dropout(input_dropout)
         self.input_projection = nn.Linear(n_features, d_model)
-        self.position = PositionalEncoding(d_model)
+        self.position = PositionalEncoding(d_model, max_len=lookback)
 
-        layers = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu"
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, norm_first=True, activation="gelu",
         )
-
-        self.encoder = nn.TransformerEncoder(layers, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
+
+        # Attention pooling over time instead of using only the last step
+        self.attn_score = nn.Linear(d_model, 1)
+
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, horizon)
+            nn.Linear(d_model, horizon),
         )
 
     def forward(self, x):
-        x = self.input_projection(x)
-        x = self.position(x)
-        x = self.encoder(x)
-        x = self.norm(x[:, -1, :])
-        return self.head(x)
+        skip = self.linear_skip(x[:, :, self.target_idx])
+
+        if self.training and self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+
+        h = self.input_dropout(self.input_norm(x))
+        h = self.position(self.input_projection(h))
+        h = self.norm(self.encoder(h))
+
+        w = torch.softmax(self.attn_score(h), dim=1)   # (B, T, 1)
+        pooled = (w * h).sum(dim=1)
+        return skip + self.head(pooled)

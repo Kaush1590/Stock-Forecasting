@@ -4,10 +4,13 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 def add_features(df):
     out = df.copy()
-    out["Return"] = out["Close"].pct_change()
-    out["MA_5"] = out["Close"].rolling(5).mean()
-    out["MA_20"] = out["Close"].rolling(20).mean()
+    out["Return"] = np.log(out["Close"]).diff()
+    out["HL_range"] = (out["High"] - out["Low"]) / out["Close"]
+    out["OC_change"] = (out["Close"] - out["Open"]) / out["Open"]
+    out["MA5_ratio"] = out["Close"].rolling(5).mean() / out["Close"] - 1
+    out["MA20_ratio"] = out["Close"].rolling(20).mean() / out["Close"] - 1
     out["Volatility_10"] = out["Return"].rolling(10).std()
+    out["Vol_change"] = np.log1p(out["Volume"]).diff()
     return out.replace([np.inf, -np.inf], np.nan).dropna()
 
 def split(df: pd.DataFrame, train_size=0.7, val_size=0.1):
